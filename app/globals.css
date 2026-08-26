@@ -285,6 +285,68 @@ button { border: 0; }
   padding-bottom: 18px;
 }
 
+.chart-result-header-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.export-button {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 11px;
+  border: 1px solid #e1d4cb;
+  border-radius: 8px;
+  background: #fffaf5;
+  color: #a84e31;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+  transition: background 160ms ease, border-color 160ms ease, color 160ms ease, transform 120ms ease;
+}
+
+.export-button svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.export-button:hover,
+.export-button:focus-visible {
+  border-color: #ffb08e;
+  background: #fff1e9;
+  color: var(--orange);
+}
+
+.export-button:active { transform: scale(0.985); }
+
+.export-button:disabled {
+  cursor: wait;
+  opacity: 0.68;
+}
+
+.export-spinner {
+  width: 13px;
+  height: 13px;
+  border: 2px solid #f0cfc0;
+  border-top-color: var(--orange);
+  border-radius: 50%;
+  animation: confidence-spin 0.9s linear infinite;
+}
+
+.chart-export-error {
+  margin: -10px 0 0;
+  color: #a13e32;
+  font-size: 11px;
+}
+
 .chart-result-kicker {
   color: var(--orange);
   font-size: 10px;

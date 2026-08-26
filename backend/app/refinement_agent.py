@@ -39,9 +39,10 @@ Hard rules:
 - Every proposed cell change must cite at least one supplied sourceId.
 - Read requests must be answered as a preview in chat; return an empty patches array.
 - Never apply a change. Return a proposal only. The application will request human approval.
-- Evidence-edit requests that name a row and provide supporting document content are actionable;
-  do not ask the user to choose between evidenceOfInfringement, Patent Claim, or AI Evidence.
-  Propose an evidenceOfInfringement patch when the supplied source supports it.
+- Evidence-edit requests that identify a row by number or quote a unique claim and provide an
+  attached supporting document are actionable; do not ask the user to reattach the source or
+  choose between evidenceOfInfringement, Patent Claim, or AI Evidence. Propose an
+  evidenceOfInfringement patch when the supplied source supports it.
 - If the target row or evidence is unclear, set needsHuman=true and ask one specific question.
 - Keep responses concise and professional.
 
@@ -61,6 +62,11 @@ public web search. Determine whether the user wants a read preview, an edit prop
 clarifying question. Resolve row IDs only from the supplied table. Do not draft edits here.
 Only the evidenceOfInfringement column may ever be proposed for editing; Patent Claim and AI
 Evidence are read-only.
+Attached supporting-document content and source IDs are supplied in the request context. Use
+that context when deciding whether a clear evidence-refinement request is actionable. If the
+user names a unique claim or row, asks to refine its evidence, and a supporting document is
+attached, route it as an edit in the same turn; do not ask the user to reattach or restate the
+source.
 Use web search only when the user asks for research, external evidence, or when the request
 explicitly needs public information. If the request is ambiguous, use clarify.
 
@@ -223,6 +229,31 @@ def _requested_row_index(prompt: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _normalized_match_text(value: Any) -> str:
+    """Normalize claim text for a conservative exact-substring row match."""
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _matching_claim_rows(prompt: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Find rows whose complete claim text appears in the user's request.
+
+    This intentionally requires the complete normalized claim to be present. It avoids
+    guessing from a short fragment while supporting requests that quote a claim instead of
+    using a numeric row reference.
+    """
+    prompt_text = _normalized_match_text(prompt)
+    if not prompt_text:
+        return []
+    matches: list[dict[str, Any]] = []
+    for row in rows:
+        claim_text = _normalized_match_text(row.get("patentClaim"))
+        if len(claim_text.split()) < 4:
+            continue
+        if claim_text in prompt_text:
+            matches.append(row)
+    return matches
+
+
 def _looks_like_evidence_edit(prompt: str) -> bool:
     prompt_lower = prompt.lower()
     return "evidence" in prompt_lower and any(
@@ -330,6 +361,13 @@ class RefinementAgent:
 
     async def route_node(self, state: RefinementState) -> RefinementState:
         history_context = json.dumps(state.get("history", []), ensure_ascii=False)
+        document_manifest = json.dumps(
+            [
+                {"sourceId": document["sourceId"], "filename": document["filename"]}
+                for document in state.get("documents", [])
+            ],
+            ensure_ascii=False,
+        )
         payload = _ollama_payload(
             self.settings,
             [
@@ -338,7 +376,10 @@ class RefinementAgent:
                     "role": "user",
                     "content": (
                         f"[CONVERSATION_HISTORY]\n{history_context}\n"
-                        f"[ACTIVE_TABLE]\n{state['table_context']}\n[REQUEST]\n{state['prompt']}"
+                        f"[ACTIVE_TABLE]\n{state['table_context']}\n"
+                        f"[ATTACHED_DOCUMENTS]\n{document_manifest}\n"
+                        f"{state.get('document_context', '')[:18000] or 'No attached document text was extracted.'}\n"
+                        f"[REQUEST]\n{state['prompt']}"
                     ),
                 },
             ],
@@ -360,15 +401,28 @@ class RefinementAgent:
                 if requested_row_index is not None:
                     break
         target_row_ids = [str(value) for value in route.get("targetRowIds", []) if value]
+        claim_matches = _matching_claim_rows(state["prompt"], state.get("rows", []))
+        target_resolved = False
+        resolved_from_numeric_reference = requested_row_index is not None
         if requested_row_index is not None:
             matching_row = next(
-                (row for row in state.get("rows", []) if row.get("rowIndex") == requested_row_index),
+                (
+                    row
+                    for row in state.get("rows", [])
+                    if str(row.get("rowIndex")) == str(requested_row_index)
+                ),
                 None,
             )
             if matching_row is not None:
                 target_row_ids = [str(matching_row["_id"])]
-                if intent == "clarify" and _looks_like_evidence_edit(state["prompt"]):
-                    intent = "edit"
+                target_resolved = True
+        elif len(claim_matches) == 1:
+            target_row_ids = [str(claim_matches[0]["_id"])]
+            target_resolved = True
+        if target_resolved and (
+            resolved_from_numeric_reference or state.get("documents")
+        ) and _looks_like_evidence_edit(state["prompt"]):
+            intent = "edit"
         target_columns = [str(value) for value in route.get("targetColumns", []) if value]
         if _looks_like_evidence_edit(state["prompt"]):
             target_columns = ["evidenceOfInfringement"]

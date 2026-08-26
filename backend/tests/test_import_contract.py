@@ -196,6 +196,54 @@ class ImportContractTests(unittest.TestCase):
         self.assertEqual(read_result["route"]["intent"], "read")
         self.assertEqual(read_result["route"]["targetRowIds"], [str(row_id)])
 
+    def test_first_turn_attached_document_and_claim_text_route_to_evidence_edit(self) -> None:
+        class FakeStore:
+            async def insert(self, _collection: str, document: dict) -> ObjectId:
+                return document["_id"]
+
+        row_id = ObjectId()
+        claim = "A calibration profile stored in nonvolatile memory."
+        state = {
+            "chat_id": ObjectId(),
+            "run_id": ObjectId(),
+            "message_id": ObjectId(),
+            "prompt": (
+                "Use this document and refine the infringement evidence of this claim "
+                f'"{claim}".'
+            ),
+            "history": [],
+            "rows": [{"_id": row_id, "rowIndex": 7, "patentClaim": claim}],
+            "table_context": '{"rows":[{"rowId":"%s","rowIndex":7,"patentClaim":"%s"}]}'
+            % (row_id, claim),
+            "documents": [{
+                "sourceId": "doc:supporting-1",
+                "filename": "ilumos-confidence-test-supporting-document-row-7.pdf",
+            }],
+            "document_context": (
+                "[SOURCE sourceId=doc:supporting-1 filename=...pdf]\n"
+                "[LOCATOR 1] The thermostat stores a calibration profile in nonvolatile memory."
+            ),
+        }
+        fake_route = {
+            "intent": "clarify",
+            "targetRowIds": [],
+            "targetColumns": [],
+            "useWebSearch": False,
+            "searchQuery": "",
+        }
+        agent = RefinementAgent(FakeStore(), Settings())
+
+        with patch("app.refinement_agent.request_ollama_json", return_value=fake_route) as route_call:
+            result = asyncio.run(agent.route_node(state))
+
+        self.assertEqual(result["route"]["intent"], "edit")
+        self.assertEqual(result["route"]["targetRowIds"], [str(row_id)])
+        self.assertEqual(result["route"]["targetColumns"], ["evidenceOfInfringement"])
+        route_prompt = route_call.call_args.kwargs["payload"]["messages"][1]["content"]
+        self.assertIn("[ATTACHED_DOCUMENTS]", route_prompt)
+        self.assertIn("ilumos-confidence-test-supporting-document-row-7.pdf", route_prompt)
+        self.assertIn("calibration profile", route_prompt)
+
     def test_manual_evidence_edit_creates_revision_and_resets_row_confidence(self) -> None:
         from app import main as main_module
 
@@ -513,6 +561,59 @@ class ImportContractTests(unittest.TestCase):
         self.assertEqual(rejected_store.rows[0]["evidenceOfInfringement"], original_evidence)
         self.assertEqual(rejected_store.run["revisionId"], revision_id)
         self.assertEqual(rejected_store.run["confidenceStatus"], "completed")
+
+    def test_export_pdf_uses_latest_revision_and_current_ai_evidence(self) -> None:
+        from app import main as main_module
+        from pypdf import PdfReader
+
+        chat_id = ObjectId()
+        run_id = ObjectId()
+        revision_id = ObjectId()
+
+        class ExportStore:
+            configured = True
+
+            async def find_one(self, collection: str, _query: dict) -> dict | None:
+                if collection == "analysis_runs":
+                    return {
+                        "_id": run_id,
+                        "chatId": chat_id,
+                        "status": "completed",
+                        "revisionId": revision_id,
+                    }
+                if collection == "chats":
+                    return {"_id": chat_id, "title": "Updated thermostat review"}
+                return None
+
+            async def find_many(self, collection: str, _query: dict) -> list[dict]:
+                if collection == "chart_rows":
+                    return [{
+                        "_id": ObjectId(),
+                        "revisionId": revision_id,
+                        "rowIndex": 1,
+                        "patentClaim": "A temperature control device with a wireless communication module.",
+                        "evidenceOfInfringement": "Updated evidence approved by the analyst.",
+                        "aiEvidence": "",
+                        "confidenceScore": 91,
+                        "confidenceRemark": "The approved evidence directly supports the claim element.",
+                    }]
+                return []
+
+        with patch.object(main_module, "store", ExportStore()):
+            response = asyncio.run(main_module.export_chart_pdf(
+                chat_id=str(chat_id),
+                run_id=str(run_id),
+            ))
+
+        self.assertEqual(response.media_type, "application/pdf")
+        self.assertEqual(response.headers["content-disposition"], 'attachment; filename="ilumos-claim-chart.pdf"')
+        self.assertTrue(response.body.startswith(b"%PDF"))
+        extracted_text = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(response.body)).pages)
+        normalized_text = " ".join(extracted_text.split())
+        self.assertIn("Updated thermostat review", extracted_text)
+        self.assertIn("Updated evidence approved by the analyst.", extracted_text)
+        self.assertIn("91% confidence", extracted_text)
+        self.assertIn("The approved evidence directly supports the claim element.", normalized_text)
 
     def test_xlsx_keeps_review_columns_out_of_evidence(self) -> None:
         workbook = Workbook()

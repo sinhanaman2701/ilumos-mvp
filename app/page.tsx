@@ -140,6 +140,10 @@ function ArrowRightIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6" /></svg>;
 }
 
+function DownloadIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M8 11l4 4 4-4M5 19.5h14" /></svg>;
+}
+
 function tableColumnLabel(column: string) {
   if (column === "patentClaim") return "Patent Claim";
   if (column === "evidenceOfInfringement") return "Evidence of Infringement";
@@ -172,6 +176,8 @@ export default function Home() {
   const [editingEvidenceRowId, setEditingEvidenceRowId] = useState<string | null>(null);
   const [editingEvidenceValue, setEditingEvidenceValue] = useState("");
   const [isSavingEvidence, setIsSavingEvidence] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
   const claimInputRef = useRef<HTMLInputElement>(null);
   const supportingInputRef = useRef<HTMLInputElement>(null);
   const activeRunIdRef = useRef<string | null>(null);
@@ -226,6 +232,8 @@ export default function Home() {
     setConfidenceActiveRow(null);
     setEditingEvidenceRowId(null);
     setEditingEvidenceValue("");
+    setIsExporting(false);
+    setExportError(null);
     setProcessingStatus("idle");
     setAssistantOpen(false);
     setMessages([]);
@@ -637,6 +645,36 @@ export default function Home() {
     }
   };
 
+  const exportChart = async () => {
+    if (isExporting || !activeChat || !activeRunIdRef.current || !processedChart?.length) return;
+    const chatId = activeChat;
+    const runId = activeRunIdRef.current;
+    setIsExporting(true);
+    setExportError(null);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/chats/${chatId}/export.pdf?run_id=${encodeURIComponent(runId)}`,
+      );
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.detail || "The chart could not be exported.");
+      }
+      const pdfBlob = await response.blob();
+      const downloadUrl = URL.createObjectURL(pdfBlob);
+      const link = document.createElement("a");
+      link.href = downloadUrl;
+      link.download = "ilumos-claim-chart.pdf";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(downloadUrl);
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : "The chart could not be exported.");
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
   const decideAssistantAction = async (actionId: string, decision: "approve" | "reject") => {
     if (!actionId || !activeChat || !activeRunIdRef.current || actionInFlight) return;
     const runId = activeRunIdRef.current;
@@ -896,10 +934,23 @@ export default function Home() {
                   <h1 id="chart-result-heading">Extracted chart</h1>
                   <p>{processedChart.length} row{processedChart.length === 1 ? "" : "s"} extracted from the uploaded claim chart documents.</p>
                 </div>
-                <span className="chart-result-badge">
-                  {confidenceStatus === "generating" ? `Scoring row ${confidenceActiveRow ?? ""} of ${processedChart.length}` : confidenceStatus === "ready" ? "Confidence ready" : "Chart ready"}
-                </span>
+                <div className="chart-result-header-actions">
+                  <button
+                    className="export-button"
+                    type="button"
+                    onClick={() => void exportChart()}
+                    disabled={isExporting || !activeChat || !activeRunIdRef.current || processedChart.length === 0}
+                    aria-busy={isExporting}
+                  >
+                    {isExporting ? <span className="export-spinner" aria-hidden="true" /> : <DownloadIcon />}
+                    <span>{isExporting ? "Preparing PDF..." : "Export PDF"}</span>
+                  </button>
+                  <span className="chart-result-badge">
+                    {confidenceStatus === "generating" ? `Scoring row ${confidenceActiveRow ?? ""} of ${processedChart.length}` : confidenceStatus === "ready" ? "Confidence ready" : "Chart ready"}
+                  </span>
+                </div>
               </div>
+              {exportError && <p className="chart-export-error" role="alert">{exportError}</p>}
               <div className="chart-table-wrap">
                 <table className="chart-table">
                   <thead>

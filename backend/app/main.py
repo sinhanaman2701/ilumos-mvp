@@ -1,9 +1,11 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from io import BytesIO
 import asyncio
 import json
 from pathlib import Path
 from typing import Annotated, Literal
+from xml.sax.saxutils import escape
 
 from bson import ObjectId
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile, status
@@ -635,6 +637,178 @@ async def get_chart_table(chat_id: str, run_id: str) -> ChartTableResponse:
         chart_revision_id=str(revision_id) if isinstance(revision_id, ObjectId) else None,
         error=run.get("error"),
         chart_rows=[serialize_chart_row(row) for row in rows],
+    )
+
+
+def _pdf_text(value: object, fallback: str = "-") -> str:
+    """Escape table text while keeping intentional line breaks readable in the PDF."""
+    text = str(value or fallback).replace("\r\n", "\n").replace("\r", "\n")
+    # ReportLab's built-in Helvetica does not include several typographic
+    # characters commonly copied from patent PDFs. Normalize them to their
+    # readable ASCII equivalents so the export never contains missing-glyph
+    # boxes (for example, U+2011 in “built‑in”).
+    text = text.translate(str.maketrans({
+        "\u00a0": " ",
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "--",
+        "\u2212": "-",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201a": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2026": "...",
+    }))
+    return escape(text).replace("\n", "<br/>")
+
+
+def _build_chart_pdf(*, title: str, rows: list[dict]) -> bytes:
+    """Build a paginated, landscape claim-chart PDF from the current revision."""
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    output = BytesIO()
+    page_width, page_height = landscape(A4)
+    document = SimpleDocTemplate(
+        output,
+        pagesize=(page_width, page_height),
+        leftMargin=14 * mm,
+        rightMargin=14 * mm,
+        topMargin=13 * mm,
+        bottomMargin=13 * mm,
+        title=title,
+        author="iLumos",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "ExportTitle",
+        parent=styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=17,
+        leading=21,
+        textColor=colors.HexColor("#202426"),
+        alignment=TA_LEFT,
+        spaceAfter=3 * mm,
+    )
+    metadata_style = ParagraphStyle(
+        "ExportMetadata",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor("#747979"),
+        spaceAfter=5 * mm,
+    )
+    header_style = ParagraphStyle(
+        "ExportHeader",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=8.5,
+        leading=10,
+        textColor=colors.HexColor("#3d4445"),
+    )
+    cell_style = ParagraphStyle(
+        "ExportCell",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=8.2,
+        leading=10.5,
+        textColor=colors.HexColor("#33383a"),
+        alignment=TA_LEFT,
+    )
+    confidence_style = ParagraphStyle(
+        "ExportConfidence",
+        parent=cell_style,
+        fontName="Helvetica-Bold",
+        textColor=colors.HexColor("#2f6d4a"),
+    )
+
+    table_data = [[
+        Paragraph("Patent Claim", header_style),
+        Paragraph("Evidence of Infringement", header_style),
+        Paragraph("AI Evidence", header_style),
+    ]]
+    for row in sorted(rows, key=lambda item: item.get("rowIndex", 0)):
+        confidence_score = row.get("confidenceScore")
+        confidence_remark = row.get("confidenceRemark") or ""
+        if isinstance(confidence_score, (int, float)):
+            ai_content = f"<b>{confidence_score:g}% confidence</b>"
+            if confidence_remark:
+                ai_content += f"<br/>{_pdf_text(confidence_remark, '')}"
+            ai_cell = Paragraph(ai_content, confidence_style)
+        else:
+            ai_cell = Paragraph(_pdf_text(row.get("aiEvidence") or "-"), cell_style)
+        table_data.append([
+            Paragraph(_pdf_text(row.get("patentClaim")), cell_style),
+            Paragraph(_pdf_text(row.get("evidenceOfInfringement")), cell_style),
+            ai_cell,
+        ])
+
+    table = Table(
+        table_data,
+        colWidths=[58 * mm, 103 * mm, 80 * mm],
+        repeatRows=1,
+        splitByRow=1,
+        hAlign="LEFT",
+    )
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f2eee7")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#3d4445")),
+        ("GRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#dedbd5")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#fcfbf8")]),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    document.build([
+        Paragraph(_pdf_text(title, "iLumos Claim Chart"), title_style),
+        Paragraph(
+            f"{len(rows)} row{'s' if len(rows) != 1 else ''} - Exported from the latest approved table revision",
+            metadata_style,
+        ),
+        table,
+        Spacer(1, 3 * mm),
+    ])
+    return output.getvalue()
+
+
+@app.get("/api/chats/{chat_id}/export.pdf")
+async def export_chart_pdf(chat_id: str, run_id: str) -> Response:
+    """Export the latest persisted chart revision, including current confidence values."""
+    require_database()
+    try:
+        chat_object_id = ObjectId(chat_id)
+        run_object_id = ObjectId(run_id)
+    except Exception as error:
+        raise HTTPException(status_code=400, detail="Invalid chat or run identifier.") from error
+
+    run = await store.find_one(
+        "analysis_runs", {"_id": run_object_id, "chatId": chat_object_id}
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="Chart run not found.")
+    revision_id = run.get("revisionId")
+    if run.get("status") != "completed" or not isinstance(revision_id, ObjectId):
+        raise HTTPException(status_code=409, detail="The chart table is not ready to export yet.")
+
+    rows = await store.find_many("chart_rows", {"revisionId": revision_id})
+    rows = sorted(rows, key=lambda item: item.get("rowIndex", 0))
+    chat = await store.find_one("chats", {"_id": chat_object_id})
+    title = str((chat or {}).get("title") or "iLumos Claim Chart")
+    pdf_bytes = _build_chart_pdf(title=title, rows=rows)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="ilumos-claim-chart.pdf"'},
     )
 
 
