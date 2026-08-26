@@ -69,7 +69,7 @@ Sidebar typography, width, button scale, and top/bottom padding are compact and 
 
 The sidebar is fixed to the viewport height. When recent charts exceed the available space, only the Recent charts list scrolls; the outer black frame and its top/bottom padding remain fixed and visible. Recent charts load through the same-origin API proxy so persisted Atlas charts are visible in the browser.
 
-The right assistant panel follows the same fixed-height behavior. Its conversation history scrolls independently while the composer remains anchored at the bottom and the surrounding black frame remains visible.
+The right assistant panel follows the same fixed-height behavior. Its conversation history scrolls independently while the composer remains anchored at the bottom and the surrounding black frame remains visible. The chart table keeps `S. No.` in a narrow fixed-width column so the three content columns retain the available space.
 
 ### Basic micro-interactions
 

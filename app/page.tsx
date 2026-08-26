@@ -864,6 +864,12 @@ export default function Home() {
               </div>
               <div className="chart-table-wrap">
                 <table className="chart-table" aria-label="Chart loading preview">
+                  <colgroup>
+                    <col className="chart-serial-column" />
+                    <col />
+                    <col />
+                    <col />
+                  </colgroup>
                   <thead>
                     <tr><th className="chart-serial-column">S. No.</th><th>Patent Claim</th><th>Evidence of Infringement</th><th>AI Evidence</th></tr>
                   </thead>
@@ -955,6 +961,12 @@ export default function Home() {
               {exportError && <p className="chart-export-error" role="alert">{exportError}</p>}
               <div className="chart-table-wrap">
                 <table className="chart-table">
+                  <colgroup>
+                    <col className="chart-serial-column" />
+                    <col />
+                    <col />
+                    <col />
+                  </colgroup>
                   <thead>
                     <tr>
                       <th className="chart-serial-column">S. No.</th>
