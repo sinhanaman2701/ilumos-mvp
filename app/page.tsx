@@ -14,6 +14,7 @@ type RecentChat = {
 };
 
 type ChartRow = {
+  rowId: string;
   rowIndex: number;
   patentClaim: string;
   evidenceOfInfringement: string;
@@ -168,6 +169,9 @@ export default function Home() {
   const [assistantOpen, setAssistantOpen] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [fileNamesById, setFileNamesById] = useState<Record<string, string>>({});
+  const [editingEvidenceRowId, setEditingEvidenceRowId] = useState<string | null>(null);
+  const [editingEvidenceValue, setEditingEvidenceValue] = useState("");
+  const [isSavingEvidence, setIsSavingEvidence] = useState(false);
   const claimInputRef = useRef<HTMLInputElement>(null);
   const supportingInputRef = useRef<HTMLInputElement>(null);
   const activeRunIdRef = useRef<string | null>(null);
@@ -220,6 +224,8 @@ export default function Home() {
     setProcessedChart(null);
     setConfidenceStatus("idle");
     setConfidenceActiveRow(null);
+    setEditingEvidenceRowId(null);
+    setEditingEvidenceValue("");
     setProcessingStatus("idle");
     setAssistantOpen(false);
     setMessages([]);
@@ -319,6 +325,8 @@ export default function Home() {
         fileId: attachment.id,
         })));
       setMessages(payload.messages ?? []);
+      setEditingEvidenceRowId(null);
+      setEditingEvidenceValue("");
       setProcessedChart(payload.processing_status === "completed" ? (payload.chart_rows ?? []) : null);
       setProcessingStatus(payload.processing_status === "completed" ? "ready" : payload.processing_status === "failed" ? "error" : "processing");
       setConfidenceStatus(payload.confidence_status === "completed" ? "ready" : payload.confidence_status === "generating" ? "generating" : "idle");
@@ -370,6 +378,8 @@ export default function Home() {
       setActiveChat(payload.chat_id);
       setClaimFiles([]);
       setProcessedChart(null);
+      setEditingEvidenceRowId(null);
+      setEditingEvidenceValue("");
       setProcessingStatus("processing");
       setConfidenceStatus("idle");
       void waitForTable(payload.chat_id, payload.run_id, generation);
@@ -663,6 +673,62 @@ export default function Home() {
     }
   };
 
+  const startEvidenceEdit = (row: ChartRow) => {
+    if (confidenceStatus === "generating" || isSavingEvidence) return;
+    setEditingEvidenceRowId(row.rowId || String(row.rowIndex));
+    setEditingEvidenceValue(row.evidenceOfInfringement);
+    setSubmitError(null);
+  };
+
+  const cancelEvidenceEdit = () => {
+    setEditingEvidenceRowId(null);
+    setEditingEvidenceValue("");
+  };
+
+  const saveEvidenceEdit = async (row: ChartRow) => {
+    if (!activeChat || !activeRunIdRef.current || isSavingEvidence) return;
+    const value = editingEvidenceValue.trim();
+    if (!value) {
+      setSubmitError("Evidence cannot be empty.");
+      return;
+    }
+    if (value === row.evidenceOfInfringement) {
+      cancelEvidenceEdit();
+      return;
+    }
+
+    const runId = activeRunIdRef.current;
+    const generation = workspaceGenerationRef.current;
+    setIsSavingEvidence(true);
+    setSubmitError(null);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/chats/${activeChat}/rows/${encodeURIComponent(row.rowId || String(row.rowIndex))}/evidence`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ run_id: runId, old_value: row.evidenceOfInfringement, value }),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail || "The evidence could not be saved.");
+      if (workspaceGenerationRef.current !== generation || activeRunIdRef.current !== runId) return;
+
+      confidenceAbortRef.current?.abort();
+      setProcessedChart(payload.chart_rows ?? []);
+      setEditingEvidenceRowId(null);
+      setEditingEvidenceValue("");
+      setConfidenceStatus("idle");
+      setConfidenceActiveRow(null);
+      if (payload.chart_rows?.length > 0) void generateConfidence(activeChat, runId, generation);
+    } catch (error) {
+      if (workspaceGenerationRef.current !== generation || activeRunIdRef.current !== runId) return;
+      setSubmitError(error instanceof Error ? error.message : "The evidence could not be saved.");
+    } finally {
+      setIsSavingEvidence(false);
+    }
+  };
+
   const handleComposerKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -844,11 +910,54 @@ export default function Home() {
                     </tr>
                   </thead>
                   <tbody>
-                    {processedChart.map((row) => (
-                      <tr key={row.rowIndex}>
+                    {processedChart.map((row) => {
+                      const rowId = row.rowId || String(row.rowIndex);
+                      return (
+                      <tr key={rowId}>
                         <td>{row.patentClaim || "—"}</td>
                         <td>
-                          <span>{row.evidenceOfInfringement || "—"}</span>
+                          {editingEvidenceRowId === rowId ? (
+                            <div className="evidence-editor">
+                              <textarea
+                                aria-label={`Edit evidence for row ${row.rowIndex}`}
+                                rows={4}
+                                value={editingEvidenceValue}
+                                onChange={(event) => setEditingEvidenceValue(event.target.value)}
+                                disabled={isSavingEvidence}
+                              />
+                              <div className="evidence-editor-actions">
+                                <button
+                                  className="evidence-save-button"
+                                  type="button"
+                                  onClick={() => void saveEvidenceEdit(row)}
+                                  disabled={isSavingEvidence}
+                                >
+                                  {isSavingEvidence ? "Saving…" : "Save evidence"}
+                                </button>
+                                <button
+                                  className="evidence-cancel-button"
+                                  type="button"
+                                  onClick={cancelEvidenceEdit}
+                                  disabled={isSavingEvidence}
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="evidence-cell-display">
+                              <span>{row.evidenceOfInfringement || "—"}</span>
+                              <button
+                                className="evidence-edit-button"
+                                type="button"
+                                onClick={() => startEvidenceEdit(row)}
+                                disabled={confidenceStatus === "generating" || isSavingEvidence}
+                                aria-label={`Edit evidence for row ${row.rowIndex}`}
+                              >
+                                Edit
+                              </button>
+                            </div>
+                          )}
                           {row.imageRefs && row.imageRefs.length > 0 && (
                             <span className="row-images" aria-label="Source images">
                               {row.imageRefs.map((image) => (
@@ -877,7 +986,8 @@ export default function Home() {
                           ) : row.aiEvidence || ""}
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

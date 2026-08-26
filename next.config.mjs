@@ -1,5 +1,5 @@
 /** @type {import('next').NextConfig} */
-const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || (process.env.VERCEL ? "/backend" : "");
+const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "";
 
 const nextConfig = {
   reactStrictMode: true,

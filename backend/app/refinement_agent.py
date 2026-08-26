@@ -39,14 +39,17 @@ Hard rules:
 - Every proposed cell change must cite at least one supplied sourceId.
 - Read requests must be answered as a preview in chat; return an empty patches array.
 - Never apply a change. Return a proposal only. The application will request human approval.
+- Evidence-edit requests that name a row and provide supporting document content are actionable;
+  do not ask the user to choose between evidenceOfInfringement, Patent Claim, or AI Evidence.
+  Propose an evidenceOfInfringement patch when the supplied source supports it.
 - If the target row or evidence is unclear, set needsHuman=true and ask one specific question.
 - Keep responses concise and professional.
 
 Return only one valid JSON object in this exact shape:
 {"intent":"read|edit|clarify","answer":"...","needsHuman":false,"humanQuestion":"","sources":[],"patches":[]}
 
-Each patch must use an existing rowId and one of these columns exactly:
-patentClaim, evidenceOfInfringement, aiEvidence.
+Each patch must use an existing rowId and this column exactly:
+evidenceOfInfringement.
 Each patch must contain: rowId, column, oldValue, newValue, reason, sourceRefs.
 Each sourceRef must contain a sourceId from the supplied context and an optional locator.
 """
@@ -56,6 +59,8 @@ ROUTE_SYSTEM_PROMPT = """You route one request for the iLumos table assistant.
 The assistant has access only to the active table, attached supporting documents, and bounded
 public web search. Determine whether the user wants a read preview, an edit proposal, or a
 clarifying question. Resolve row IDs only from the supplied table. Do not draft edits here.
+Only the evidenceOfInfringement column may ever be proposed for editing; Patent Claim and AI
+Evidence are read-only.
 Use web search only when the user asks for research, external evidence, or when the request
 explicitly needs public information. If the request is ambiguous, use clarify.
 
@@ -212,6 +217,20 @@ def _source_ids(value: Any) -> Iterable[str]:
     return ids
 
 
+def _requested_row_index(prompt: str) -> int | None:
+    """Resolve the common human-facing row reference before asking the model."""
+    match = re.search(r"\b(?:row|claim|element)\s*(?:number\s*)?(\d+)\b", prompt, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _looks_like_evidence_edit(prompt: str) -> bool:
+    prompt_lower = prompt.lower()
+    return "evidence" in prompt_lower and any(
+        word in prompt_lower
+        for word in ("add", "change", "edit", "fix", "improve", "refine", "rewrite", "update", "replace")
+    )
+
+
 class RefinementAgent:
     """Separate table-only refinement graph; it does not call parser/confidence workflows."""
 
@@ -310,11 +329,18 @@ class RefinementAgent:
         return next_state
 
     async def route_node(self, state: RefinementState) -> RefinementState:
+        history_context = json.dumps(state.get("history", []), ensure_ascii=False)
         payload = _ollama_payload(
             self.settings,
             [
                 {"role": "system", "content": ROUTE_SYSTEM_PROMPT},
-                {"role": "user", "content": f"[ACTIVE_TABLE]\n{state['table_context']}\n[REQUEST]\n{state['prompt']}"},
+                {
+                    "role": "user",
+                    "content": (
+                        f"[CONVERSATION_HISTORY]\n{history_context}\n"
+                        f"[ACTIVE_TABLE]\n{state['table_context']}\n[REQUEST]\n{state['prompt']}"
+                    ),
+                },
             ],
             700,
         )
@@ -327,10 +353,29 @@ class RefinementAgent:
         intent = str(route.get("intent", "read")).lower()
         if intent not in {"read", "edit", "clarify"}:
             intent = "clarify"
+        requested_row_index = _requested_row_index(state["prompt"])
+        if requested_row_index is None:
+            for prior_turn in reversed(state.get("history", [])):
+                requested_row_index = _requested_row_index(prior_turn.get("content", ""))
+                if requested_row_index is not None:
+                    break
+        target_row_ids = [str(value) for value in route.get("targetRowIds", []) if value]
+        if requested_row_index is not None:
+            matching_row = next(
+                (row for row in state.get("rows", []) if row.get("rowIndex") == requested_row_index),
+                None,
+            )
+            if matching_row is not None:
+                target_row_ids = [str(matching_row["_id"])]
+                if intent == "clarify" and _looks_like_evidence_edit(state["prompt"]):
+                    intent = "edit"
+        target_columns = [str(value) for value in route.get("targetColumns", []) if value]
+        if _looks_like_evidence_edit(state["prompt"]):
+            target_columns = ["evidenceOfInfringement"]
         normalized_route = {
             "intent": intent,
-            "targetRowIds": [str(value) for value in route.get("targetRowIds", []) if value],
-            "targetColumns": [str(value) for value in route.get("targetColumns", []) if value],
+            "targetRowIds": target_row_ids,
+            "targetColumns": target_columns,
             "useWebSearch": bool(route.get("useWebSearch")),
             "searchQuery": _clean_text(route.get("searchQuery"), 240),
             "reason": _clean_text(route.get("reason"), 500),
@@ -387,12 +432,8 @@ class RefinementAgent:
         issues: list[str] = []
         patches: list[dict[str, Any]] = []
         column_aliases = {
-            "patent claim": "patentClaim",
-            "patentclaim": "patentClaim",
             "evidence of infringement": "evidenceOfInfringement",
             "evidenceofinfringement": "evidenceOfInfringement",
-            "ai evidence": "aiEvidence",
-            "aievidence": "aiEvidence",
         }
         returned_patches = response.get("patches", [])
         if not isinstance(returned_patches, list):
@@ -412,8 +453,8 @@ class RefinementAgent:
                 continue
             raw_column = str(candidate.get("column", "")).strip()
             column = column_aliases.get(raw_column.lower(), raw_column)
-            if column not in {"patentClaim", "evidenceOfInfringement", "aiEvidence"}:
-                issues.append(f"Ignored an unsupported table column: {raw_column}.")
+            if column != "evidenceOfInfringement":
+                issues.append(f"Ignored a read-only table column: {raw_column or 'unknown'}.")
                 continue
             new_value = candidate.get("newValue", candidate.get("value"))
             if not isinstance(new_value, str) or not new_value.strip() or len(new_value) > 16000:

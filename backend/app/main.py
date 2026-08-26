@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from fastapi.responses import Response, StreamingResponse
 
 from .db import MongoStore
+from .llm_evaluator import LLMEvaluationError
 from .refinement_agent import RefinementAgent, format_refinement_response
 from .settings import Settings
 from .workflow import ChartWorkflow
@@ -127,6 +128,19 @@ class AssistantActionResponse(BaseModel):
     chart_rows: list[dict] = Field(default_factory=list)
 
 
+class EvidenceEditRequest(BaseModel):
+    run_id: str
+    old_value: str
+    value: str
+
+
+class EvidenceEditResponse(BaseModel):
+    chat_id: str
+    run_id: str
+    chart_revision_id: str
+    chart_rows: list[dict] = Field(default_factory=list)
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -141,6 +155,7 @@ def require_database() -> None:
 
 def serialize_chart_row(row: dict) -> dict:
     return {
+        "rowId": str(row["_id"]) if isinstance(row.get("_id"), ObjectId) else str(row.get("rowId", "")),
         "rowIndex": row["rowIndex"],
         "patentClaim": row["patentClaim"],
         "evidenceOfInfringement": row["evidenceOfInfringement"],
@@ -784,38 +799,19 @@ async def create_chat_message(
     )
 
 
-async def apply_table_action(
+async def _persist_evidence_revision(
     *,
     chat_id: ObjectId,
     run_id: ObjectId,
-    action: dict,
+    run: dict,
+    current_revision_id: ObjectId,
+    current_rows: list[dict],
+    evidence_updates: dict[str, str],
+    revision_type: str,
+    audit_event: str,
+    action_id: ObjectId | None = None,
 ) -> tuple[ObjectId, list[dict]]:
-    run = await store.find_one("analysis_runs", {"_id": run_id, "chatId": chat_id})
-    if run is None or run.get("status") != "completed":
-        raise HTTPException(status_code=409, detail="The chart table is not ready for changes.")
-    current_revision_id = run.get("revisionId")
-    action_revision_id = action.get("sourceRevisionId")
-    if not isinstance(current_revision_id, ObjectId) or str(current_revision_id) != str(action_revision_id):
-        raise HTTPException(status_code=409, detail="The table changed while this proposal was waiting. Ask iLumos to review it again.")
-
-    current_rows = sorted(
-        await store.find_many("chart_rows", {"revisionId": current_revision_id}),
-        key=lambda row: row["rowIndex"],
-    )
-    rows_by_id = {str(row["_id"]): row for row in current_rows}
-    patches_by_cell: dict[tuple[str, str], dict] = {}
-    for patch in action.get("patches", []):
-        row_id = str(patch.get("rowId", ""))
-        column = str(patch.get("column", ""))
-        row = rows_by_id.get(row_id)
-        if row is None or column not in {"patentClaim", "evidenceOfInfringement", "aiEvidence"}:
-            raise HTTPException(status_code=409, detail="This proposal is no longer valid for the active table.")
-        if str(row.get(column, "")) != str(patch.get("oldValue", "")):
-            raise HTTPException(status_code=409, detail="The table changed while this proposal was waiting. Ask iLumos to review it again.")
-        patches_by_cell[(row_id, column)] = patch
-
     revision_id = ObjectId()
-    changed_source_columns = False
     row_documents: list[dict] = []
     for current_row in current_rows:
         row_id = str(current_row["_id"])
@@ -825,15 +821,8 @@ async def apply_table_action(
             "revisionId": revision_id,
             "createdAt": now_utc(),
         }
-        row_changed_source = False
-        for (patch_row_id, column), patch in patches_by_cell.items():
-            if patch_row_id != row_id:
-                continue
-            row_document[column] = patch["newValue"]
-            if column != "aiEvidence":
-                row_changed_source = True
-                changed_source_columns = True
-        if row_changed_source:
+        if row_id in evidence_updates:
+            row_document["evidenceOfInfringement"] = evidence_updates[row_id]
             row_document["aiEvidence"] = ""
             row_document.pop("confidenceScore", None)
             row_document.pop("confidenceRemark", None)
@@ -849,38 +838,156 @@ async def apply_table_action(
             "rowCount": len(row_documents),
             "sourceClaimChartCount": run.get("sourceClaimChartCount", 0),
             "supersedesRevisionId": current_revision_id,
-            "revisionType": "assistant_refinement",
+            "revisionType": revision_type,
             "verificationMode": "human-approved-table-refinement",
             "evaluationApproved": True,
             "createdAt": now_utc(),
         },
     )
-    run_update: dict[str, object] = {
+    await store.update(
+        "analysis_runs",
+        {"_id": run_id},
+        {
+            "$set": {
+                "revisionId": revision_id,
+                "confidenceStatus": "pending",
+                "updatedAt": now_utc(),
+            },
+            "$unset": {"confidenceError": ""},
+        },
+    )
+    audit: dict[str, Any] = {
+        "_id": ObjectId(),
+        "chatId": chat_id,
+        "runId": run_id,
+        "event": audit_event,
         "revisionId": revision_id,
-        "updatedAt": now_utc(),
+        "patchCount": len(evidence_updates),
+        "createdAt": now_utc(),
     }
-    if changed_source_columns:
-        run_update["confidenceStatus"] = "pending"
-    await store.update("analysis_runs", {"_id": run_id}, {"$set": run_update})
+    if action_id is not None:
+        audit["actionId"] = action_id
+    await store.insert("audit_events", audit)
+    return revision_id, row_documents
+
+
+async def apply_table_action(
+    *,
+    chat_id: ObjectId,
+    run_id: ObjectId,
+    action: dict,
+) -> tuple[ObjectId, list[dict]]:
+    run = await store.find_one("analysis_runs", {"_id": run_id, "chatId": chat_id})
+    if run is None or run.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="The chart table is not ready for changes.")
+    if run.get("confidenceStatus") == "generating":
+        raise HTTPException(status_code=409, detail="Wait for confidence scoring to finish before editing evidence.")
+    current_revision_id = run.get("revisionId")
+    action_revision_id = action.get("sourceRevisionId")
+    if not isinstance(current_revision_id, ObjectId) or str(current_revision_id) != str(action_revision_id):
+        raise HTTPException(status_code=409, detail="The table changed while this proposal was waiting. Ask iLumos to review it again.")
+
+    current_rows = sorted(
+        await store.find_many("chart_rows", {"revisionId": current_revision_id}),
+        key=lambda row: row["rowIndex"],
+    )
+    rows_by_id = {str(row["_id"]): row for row in current_rows}
+    evidence_updates: dict[str, str] = {}
+    for patch in action.get("patches", []):
+        row_id = str(patch.get("rowId", ""))
+        column = str(patch.get("column", ""))
+        row = rows_by_id.get(row_id)
+        if row is None or column != "evidenceOfInfringement":
+            raise HTTPException(status_code=409, detail="Only the Evidence of Infringement column can be changed.")
+        new_value = patch.get("newValue")
+        if not isinstance(new_value, str) or not new_value.strip() or len(new_value) > 16000:
+            raise HTTPException(status_code=409, detail="The proposed evidence value is invalid.")
+        if str(row.get(column, "")) != str(patch.get("oldValue", "")):
+            raise HTTPException(status_code=409, detail="The table changed while this proposal was waiting. Ask iLumos to review it again.")
+        evidence_updates[row_id] = new_value
+
+    revision_id, row_documents = await _persist_evidence_revision(
+        chat_id=chat_id,
+        run_id=run_id,
+        run=run,
+        current_revision_id=current_revision_id,
+        current_rows=current_rows,
+        evidence_updates=evidence_updates,
+        revision_type="assistant_evidence_refinement",
+        audit_event="assistant_evidence_patch_applied",
+        action_id=action["_id"],
+    )
     await store.update(
         "agent_actions",
         {"_id": action["_id"], "status": "applying"},
         {"$set": {"status": "applied", "appliedRevisionId": revision_id, "decidedAt": now_utc()}},
     )
-    await store.insert(
-        "audit_events",
-        {
-            "_id": ObjectId(),
-            "chatId": chat_id,
-            "runId": run_id,
-            "event": "assistant_table_patch_applied",
-            "actionId": action["_id"],
-            "revisionId": revision_id,
-            "patchCount": len(patches_by_cell),
-            "createdAt": now_utc(),
-        },
-    )
     return revision_id, row_documents
+
+
+@app.patch(
+    "/api/chats/{chat_id}/rows/{row_id}/evidence",
+    response_model=EvidenceEditResponse,
+)
+async def edit_evidence_cell(
+    chat_id: str,
+    row_id: str,
+    request: EvidenceEditRequest,
+) -> EvidenceEditResponse:
+    require_database()
+    try:
+        chat_object_id = ObjectId(chat_id)
+        run_object_id = ObjectId(request.run_id)
+        row_object_id = ObjectId(row_id)
+    except Exception as error:
+        raise HTTPException(status_code=400, detail="Invalid chat, run, or row identifier.") from error
+
+    value = request.value.strip()
+    if not value or len(value) > 16000:
+        raise HTTPException(status_code=400, detail="Evidence must contain between 1 and 16,000 characters.")
+    run = await store.find_one(
+        "analysis_runs", {"_id": run_object_id, "chatId": chat_object_id}
+    )
+    if run is None or run.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="The chart table is not ready for changes.")
+    if run.get("confidenceStatus") == "generating":
+        raise HTTPException(status_code=409, detail="Wait for confidence scoring to finish before editing evidence.")
+    current_revision_id = run.get("revisionId")
+    if not isinstance(current_revision_id, ObjectId):
+        raise HTTPException(status_code=409, detail="The chart has no editable table revision.")
+    current_rows = sorted(
+        await store.find_many("chart_rows", {"revisionId": current_revision_id}),
+        key=lambda row: row["rowIndex"],
+    )
+    current_row = next((row for row in current_rows if row.get("_id") == row_object_id), None)
+    if current_row is None:
+        raise HTTPException(status_code=404, detail="The requested table row was not found.")
+    if request.old_value != str(current_row.get("evidenceOfInfringement", "")):
+        raise HTTPException(status_code=409, detail="The evidence changed while you were editing. Reload the row and try again.")
+    if value == request.old_value:
+        return EvidenceEditResponse(
+            chat_id=chat_id,
+            run_id=request.run_id,
+            chart_revision_id=str(current_revision_id),
+            chart_rows=[serialize_chart_row(row) for row in current_rows],
+        )
+
+    revision_id, row_documents = await _persist_evidence_revision(
+        chat_id=chat_object_id,
+        run_id=run_object_id,
+        run=run,
+        current_revision_id=current_revision_id,
+        current_rows=current_rows,
+        evidence_updates={row_id: value},
+        revision_type="manual_evidence_edit",
+        audit_event="manual_evidence_edit_applied",
+    )
+    return EvidenceEditResponse(
+        chat_id=chat_id,
+        run_id=request.run_id,
+        chart_revision_id=str(revision_id),
+        chart_rows=[serialize_chart_row(row) for row in row_documents],
+    )
 
 
 async def mark_assistant_action_message(

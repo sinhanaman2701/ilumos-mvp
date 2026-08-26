@@ -365,6 +365,120 @@ button { border: 0; }
   line-height: 1.48;
 }
 
+.evidence-cell-display {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+}
+
+.evidence-cell-display > span {
+  min-width: 0;
+  flex: 1;
+}
+
+.evidence-edit-button {
+  flex: 0 0 auto;
+  margin: -2px 0 0;
+  padding: 4px 7px;
+  border: 1px solid #e1d4cb;
+  border-radius: 6px;
+  background: #fffaf5;
+  color: #a84e31;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  line-height: 1.2;
+  opacity: 0;
+  transition: border-color 160ms ease, background 160ms ease, color 160ms ease, opacity 160ms ease;
+}
+
+.evidence-cell-display:hover .evidence-edit-button,
+.evidence-cell-display:focus-within .evidence-edit-button,
+.evidence-edit-button:focus-visible {
+  opacity: 1;
+}
+
+.evidence-edit-button:hover,
+.evidence-edit-button:focus-visible {
+  border-color: #ffb08e;
+  background: #fff1e9;
+  color: var(--orange);
+}
+
+.evidence-edit-button:disabled,
+.evidence-save-button:disabled,
+.evidence-cancel-button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.evidence-editor {
+  display: grid;
+  gap: 8px;
+}
+
+.evidence-editor textarea {
+  width: 100%;
+  min-height: 92px;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 9px 10px;
+  border: 1px solid #d9b8a8;
+  border-radius: 8px;
+  background: #fffdfa;
+  color: #292e30;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.evidence-editor textarea:focus {
+  outline: 2px solid rgba(255, 84, 39, 0.2);
+  outline-offset: 1px;
+  border-color: var(--orange);
+}
+
+.evidence-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.evidence-save-button,
+.evidence-cancel-button {
+  min-height: 28px;
+  padding: 0 9px;
+  border-radius: 7px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 650;
+  transition: background 160ms ease, border-color 160ms ease, color 160ms ease, transform 120ms ease;
+}
+
+.evidence-save-button {
+  border: 1px solid var(--orange);
+  background: var(--orange);
+  color: #fffaf5;
+}
+
+.evidence-save-button:hover,
+.evidence-save-button:focus-visible {
+  background: var(--orange-bright);
+}
+
+.evidence-cancel-button {
+  border: 1px solid #dfded9;
+  background: transparent;
+  color: #666c6d;
+}
+
+.evidence-cancel-button:hover,
+.evidence-cancel-button:focus-visible {
+  border-color: #bdb9b2;
+  color: #33383a;
+}
+
 .confidence-cell {
   display: inline-flex;
   flex-direction: column;

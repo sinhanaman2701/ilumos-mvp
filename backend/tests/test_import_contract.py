@@ -102,6 +102,176 @@ class ImportContractTests(unittest.TestCase):
         self.assertEqual(invalid_result["patches"], [])
         self.assertTrue(any("valid source" in issue for issue in invalid_result["validation_issues"]))
 
+    def test_refinement_rejects_read_only_columns(self) -> None:
+        state = self._refinement_state(response={
+            "answer": "I found a source-backed evidence update.",
+            "patches": [
+                {
+                    "rowId": "placeholder",
+                    "column": "patentClaim",
+                    "oldValue": "A wireless communication module",
+                    "newValue": "A changed claim",
+                    "sourceRefs": ["doc:source-1"],
+                },
+                {
+                    "rowId": "placeholder",
+                    "column": "aiEvidence",
+                    "oldValue": "",
+                    "newValue": "A changed confidence remark",
+                    "sourceRefs": ["doc:source-1"],
+                },
+                {
+                    "rowId": "placeholder",
+                    "column": "evidenceOfInfringement",
+                    "oldValue": "WiFi connects to the network.",
+                    "newValue": "The device connects to the home network over WiFi.",
+                    "sourceRefs": ["doc:source-1"],
+                },
+            ],
+        })
+        row_id = str(state["rows"][0]["_id"])
+        for patch in state["response"]["patches"]:
+            patch["rowId"] = row_id
+
+        result = RefinementAgent(object(), Settings()).validate_node(state)
+
+        self.assertEqual(len(result["patches"]), 1)
+        self.assertEqual(result["patches"][0]["column"], "evidenceOfInfringement")
+        self.assertEqual(sum("read-only" in issue for issue in result["validation_issues"]), 2)
+
+    def test_row_reference_and_follow_up_are_routed_to_evidence_edit(self) -> None:
+        class FakeStore:
+            async def insert(self, _collection: str, document: dict) -> ObjectId:
+                return document["_id"]
+
+        row_id = ObjectId()
+        base_state = {
+            "chat_id": ObjectId(),
+            "run_id": ObjectId(),
+            "message_id": ObjectId(),
+            "rows": [{"_id": row_id, "rowIndex": 7}],
+            "table_context": '{"rows":[{"rowId":"%s","rowIndex":7}]}' % row_id,
+        }
+        fake_route = {
+            "intent": "clarify",
+            "targetRowIds": [],
+            "targetColumns": [],
+            "useWebSearch": False,
+            "searchQuery": "",
+        }
+        agent = RefinementAgent(FakeStore(), Settings())
+
+        first = {
+            **base_state,
+            "prompt": "Use this document to refine the evidence of infringement of row 7.",
+            "history": [],
+        }
+        with patch("app.refinement_agent.request_ollama_json", return_value=fake_route):
+            first_result = asyncio.run(agent.route_node(first))
+        self.assertEqual(first_result["route"]["intent"], "edit")
+        self.assertEqual(first_result["route"]["targetRowIds"], [str(row_id)])
+        self.assertEqual(first_result["route"]["targetColumns"], ["evidenceOfInfringement"])
+
+        follow_up = {
+            **base_state,
+            "prompt": "A calibration profile stored in nonvolatile memory. For this row, I want to refine and update the evidence of infringement.",
+            "history": [{"role": "user", "content": first["prompt"]}],
+        }
+        with patch("app.refinement_agent.request_ollama_json", return_value=fake_route):
+            follow_up_result = asyncio.run(agent.route_node(follow_up))
+        self.assertEqual(follow_up_result["route"]["intent"], "edit")
+        self.assertEqual(follow_up_result["route"]["targetRowIds"], [str(row_id)])
+        self.assertEqual(follow_up_result["route"]["targetColumns"], ["evidenceOfInfringement"])
+
+        read_turn = {
+            **base_state,
+            "prompt": "What does row 7 say now?",
+            "history": [
+                {"role": "user", "content": first["prompt"]},
+                {"role": "user", "content": follow_up["prompt"]},
+            ],
+        }
+        with patch("app.refinement_agent.request_ollama_json", return_value={**fake_route, "intent": "read"}):
+            read_result = asyncio.run(agent.route_node(read_turn))
+        self.assertEqual(read_result["route"]["intent"], "read")
+        self.assertEqual(read_result["route"]["targetRowIds"], [str(row_id)])
+
+    def test_manual_evidence_edit_creates_revision_and_resets_row_confidence(self) -> None:
+        from app import main as main_module
+
+        chat_id = ObjectId()
+        run_id = ObjectId()
+        revision_id = ObjectId()
+        row_id = ObjectId()
+
+        class FakeStore:
+            configured = True
+
+            def __init__(self) -> None:
+                self.run = {
+                    "_id": run_id,
+                    "chatId": chat_id,
+                    "status": "completed",
+                    "revisionId": revision_id,
+                    "confidenceStatus": "completed",
+                    "sourceClaimChartCount": 1,
+                }
+                self.rows = [{
+                    "_id": row_id,
+                    "revisionId": revision_id,
+                    "rowIndex": 7,
+                    "patentClaim": "A calibration profile stored in nonvolatile memory.",
+                    "evidenceOfInfringement": "The product stores a calibration profile.",
+                    "aiEvidence": "84% confidence",
+                    "confidenceScore": 84,
+                    "confidenceRemark": "Existing confidence",
+                    "source": {},
+                    "imageRefs": [],
+                }]
+                self.inserted_rows: list[dict] = []
+                self.inserted_revision: dict | None = None
+
+            async def find_one(self, collection: str, _query: dict) -> dict | None:
+                return self.run if collection == "analysis_runs" else None
+
+            async def find_many(self, collection: str, _query: dict) -> list[dict]:
+                return self.rows if collection == "chart_rows" else []
+
+            async def insert_many(self, collection: str, documents: list[dict]) -> list[ObjectId]:
+                if collection == "chart_rows":
+                    self.inserted_rows = documents
+                return [document["_id"] for document in documents]
+
+            async def insert(self, collection: str, document: dict) -> ObjectId:
+                if collection == "chart_revisions":
+                    self.inserted_revision = document
+                return document["_id"]
+
+            async def update(self, collection: str, _query: dict, update: dict) -> None:
+                if collection == "analysis_runs":
+                    self.run.update(update.get("$set", {}))
+
+        fake_store = FakeStore()
+        request = main_module.EvidenceEditRequest(
+            run_id=str(run_id),
+            old_value="The product stores a calibration profile.",
+            value="The product stores a calibration profile in nonvolatile memory.",
+        )
+        with patch.object(main_module, "store", fake_store):
+            result = asyncio.run(main_module.edit_evidence_cell(
+                chat_id=str(chat_id),
+                row_id=str(row_id),
+                request=request,
+            ))
+
+        self.assertNotEqual(result.chart_revision_id, str(revision_id))
+        self.assertEqual(result.chart_rows[0]["evidenceOfInfringement"], request.value)
+        self.assertEqual(result.chart_rows[0]["aiEvidence"], "")
+        self.assertIsNone(result.chart_rows[0]["confidenceScore"])
+        self.assertIsNone(result.chart_rows[0]["confidenceRemark"])
+        self.assertEqual(fake_store.run["confidenceStatus"], "pending")
+        self.assertEqual(fake_store.rows[0]["evidenceOfInfringement"], request.old_value)
+
     def test_approved_refinement_creates_new_revision_and_resets_confidence(self) -> None:
         from app import main as main_module
 
@@ -180,6 +350,169 @@ class ImportContractTests(unittest.TestCase):
         self.assertEqual(new_rows[0]["aiEvidence"], "")
         self.assertNotIn("confidenceScore", new_rows[0])
         self.assertEqual(fake_store.rows[0]["evidenceOfInfringement"], "WiFi connects to the network.")
+
+    def test_user_approval_updates_evidence_then_confidence_stream_regenerates(self) -> None:
+        from app import main as main_module
+        from app.workflow import ChartWorkflow
+
+        chat_id = ObjectId()
+        run_id = ObjectId()
+        revision_id = ObjectId()
+        row_id = ObjectId()
+        action_id = ObjectId()
+
+        class ApprovalStore:
+            configured = True
+
+            def __init__(self) -> None:
+                self.run = {
+                    "_id": run_id,
+                    "chatId": chat_id,
+                    "status": "completed",
+                    "revisionId": revision_id,
+                    "confidenceStatus": "completed",
+                    "sourceClaimChartCount": 1,
+                }
+                self.rows = [{
+                    "_id": row_id,
+                    "revisionId": revision_id,
+                    "rowIndex": 7,
+                    "patentClaim": "A calibration profile stored in nonvolatile memory.",
+                    "evidenceOfInfringement": "The product stores a calibration profile.",
+                    "aiEvidence": "84% confidence",
+                    "confidenceScore": 84,
+                    "confidenceRemark": "Existing confidence",
+                    "source": {},
+                    "imageRefs": [],
+                }]
+                self.action = {
+                    "_id": action_id,
+                    "chatId": chat_id,
+                    "runId": run_id,
+                    "status": "pending",
+                    "sourceRevisionId": revision_id,
+                    "patches": [{
+                        "rowId": str(row_id),
+                        "column": "evidenceOfInfringement",
+                        "oldValue": "The product stores a calibration profile.",
+                        "newValue": "The product stores a calibration profile in nonvolatile memory.",
+                    }],
+                }
+                self.revisions = {revision_id: {"_id": revision_id, "sourceClaimChartCount": 1}}
+                self.inserted_rows: list[dict] = []
+
+            async def find_one(self, collection: str, query: dict) -> dict | None:
+                if collection == "analysis_runs":
+                    return self.run
+                if collection == "agent_actions":
+                    return self.action
+                if collection == "chart_revisions":
+                    return self.revisions.get(query.get("_id"))
+                return None
+
+            async def find_many(self, collection: str, _query: dict) -> list[dict]:
+                if collection == "chart_rows":
+                    return self.rows
+                return []
+
+            async def compare_and_set(self, collection: str, query: dict, update: dict) -> bool:
+                target = self.action if collection == "agent_actions" else self.run
+                expected_status = query.get("status")
+                if expected_status is not None:
+                    if isinstance(expected_status, dict):
+                        allowed = expected_status.get("$in", [])
+                        if target.get("confidenceStatus") not in allowed:
+                            return False
+                    elif target.get("status") != expected_status:
+                        return False
+                target.update(update.get("$set", {}))
+                return True
+
+            async def insert_many(self, collection: str, documents: list[dict]) -> list[ObjectId]:
+                if collection == "chart_rows":
+                    self.inserted_rows = documents
+                return [document["_id"] for document in documents]
+
+            async def insert(self, collection: str, document: dict) -> ObjectId:
+                if collection == "chart_revisions":
+                    self.revisions[document["_id"]] = document
+                return document["_id"]
+
+            async def update(self, collection: str, _query: dict, update: dict) -> None:
+                if collection == "analysis_runs":
+                    self.run.update(update.get("$set", {}))
+                    for field in update.get("$unset", {}):
+                        self.run.pop(field, None)
+                elif collection == "agent_actions":
+                    self.action.update(update.get("$set", {}))
+
+        fake_store = ApprovalStore()
+        with patch.object(main_module, "store", fake_store):
+            approval = asyncio.run(main_module.decide_assistant_action(
+                chat_id=str(chat_id),
+                action_id=str(action_id),
+                request=main_module.AssistantActionDecisionRequest(
+                    run_id=str(run_id),
+                    decision="approve",
+                ),
+            ))
+
+        self.assertEqual(approval.status, "applied")
+        self.assertEqual(approval.chart_rows[0]["evidenceOfInfringement"], fake_store.action["patches"][0]["newValue"])
+        self.assertEqual(approval.chart_rows[0]["aiEvidence"], "")
+        self.assertEqual(fake_store.action["status"], "applied")
+        self.assertEqual(fake_store.run["confidenceStatus"], "pending")
+
+        fake_store.rows = fake_store.inserted_rows
+        fake_store.run["revisionId"] = ObjectId(approval.chart_revision_id)
+        workflow = ChartWorkflow(fake_store, Settings())
+        workflow.confidence_graph = lambda: None
+        confidence_result = {
+            "rows": [{
+                "draftRowId": str(fake_store.rows[0]["_id"]),
+                "confidenceScore": 92,
+                "confidenceRemark": "The evidence directly identifies the claimed storage behavior.",
+            }],
+            "provider": "test-confidence-provider",
+            "model": "test-model",
+        }
+        with patch.object(main_module, "store", fake_store), patch.object(main_module, "workflow", workflow):
+            with patch("app.workflow.generate_confidence_with_ollama", return_value=confidence_result):
+                response = asyncio.run(main_module.stream_chat_confidence(
+                    chat_id=str(chat_id),
+                    run_id=str(run_id),
+                ))
+
+                async def collect_events() -> str:
+                    chunks = []
+                    async for chunk in response.body_iterator:
+                        chunks.append(chunk.decode() if isinstance(chunk, bytes) else str(chunk))
+                    return "".join(chunks)
+
+                events = asyncio.run(collect_events())
+
+        self.assertIn("event: row_completed", events)
+        self.assertIn('"confidenceScore": 92', events)
+        self.assertEqual(fake_store.run["confidenceStatus"], "completed")
+        self.assertEqual(fake_store.rows[0]["evidenceOfInfringement"], fake_store.action["patches"][0]["newValue"])
+
+        rejected_store = ApprovalStore()
+        original_evidence = rejected_store.rows[0]["evidenceOfInfringement"]
+        with patch.object(main_module, "store", rejected_store):
+            rejection = asyncio.run(main_module.decide_assistant_action(
+                chat_id=str(chat_id),
+                action_id=str(action_id),
+                request=main_module.AssistantActionDecisionRequest(
+                    run_id=str(run_id),
+                    decision="reject",
+                ),
+            ))
+
+        self.assertEqual(rejection.status, "rejected")
+        self.assertEqual(rejected_store.action["status"], "rejected")
+        self.assertEqual(rejected_store.rows[0]["evidenceOfInfringement"], original_evidence)
+        self.assertEqual(rejected_store.run["revisionId"], revision_id)
+        self.assertEqual(rejected_store.run["confidenceStatus"], "completed")
 
     def test_xlsx_keeps_review_columns_out_of_evidence(self) -> None:
         workbook = Workbook()
