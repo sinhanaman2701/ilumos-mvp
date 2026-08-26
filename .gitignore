@@ -1,0 +1,15 @@
+node_modules/
+.next/
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+!.env.local.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+tmp/
+work/
+outputs/
+__pycache__/
+*.py[cod]

@@ -1,0 +1,88 @@
+# iLumos Project Notes
+
+**Repository:** `/Users/namansinha/Documents/Codex/2026-08-25/wha`  
+**Last updated:** 2026-08-26
+
+This file contains only the technical architecture and the currently finalized design/frontend decisions for iLumos.
+
+## Technical architecture discussed
+
+- **Frontend:** Next.js with React, TypeScript, Tailwind CSS, and a small custom iLumos design system.
+- **Frontend communication:** REST for application actions and Server-Sent Events for streamed AI/workflow updates. Local browser requests use the Next.js same-origin `/api` proxy to FastAPI; an explicit `NEXT_PUBLIC_API_BASE_URL` can override it.
+- **Backend:** Python with FastAPI.
+- **Document parsing:** Claim-chart import begins with a deterministic, source-preserving extraction layer for XLSX/PDF structure, text blocks, table geometry, and image assets. Ollama Cloud evaluates the extracted draft directly over HTTPS using the selected `*:cloud` model before the result is allowed into the UI. It may correct source-grounded row or mapping errors, but it must not be the source of truth for image placement. No OCR or image interpretation is required for the current import milestone.
+- **AI orchestration:** LangGraph Python for chart extraction, source validation, post-table confidence scoring, evidence retrieval, claim-element analysis, refinement suggestions, and human approval pauses.
+- **LLM evaluation layer:** After deterministic extraction, Ollama Cloud’s direct `/v1/chat/completions` endpoint receives row-focused source context and draft rows using a server-side API key. The complete source remains available to backend validation but is not sent wholesale to the model. JSON mode is requested through the OpenAI-compatible endpoint and reasoning output is disabled for machine-readable evaluation. It compares the draft with the uploaded chart, may suggest source-grounded row or column corrections, validates row completeness, and returns an evaluated final row set plus an approval decision. It must not invent text, interpret images, or relocate image references. Deterministic extracted text remains authoritative: unsupported or reordered evaluator corrections are ignored and recorded as issues rather than replacing source text. An LLM warning or unavailable evaluator falls back to the source-preserving draft after deterministic validation; it does not block a valid import. The chart evaluator does not populate `AI Evidence`; the separate confidence generator runs afterward. The UI receives rows after chart extraction, evaluation, and source validation succeed.
+- **Confidence generation layer:** The initial import creates, persists, and returns the combined table before confidence generation begins. The frontend then triggers a separate minimal LangGraph stream. It invokes one Ollama Cloud call per row, reading only that row’s `Patent Claim` and `Evidence of Infringement`, uses compact row keys, maps results back to the immutable row IDs, and streams each score/remark to the matching `AI Evidence` cell. Basic row, score, and remark checks remain; there is no additional confidence-quality evaluation stage. The score is a triage estimate, not a legal conclusion, and neither source column is changed.
+- **Right-side refinement agent:** After the table exists, a separate LangGraph handles each assistant message. It may read the active table, the user-attached supporting documents, and bounded web-search results. Its only application write capability is a proposed patch to existing table cells; it cannot write to source files, run metadata, arbitrary MongoDB collections, or external websites.
+- **Refinement graph:** `receive message → classify read/propose-edit/needs-clarification → resolve target rows/columns → gather table/document/web context → answer or create a source-linked patch preview → deterministic patch validation → persisted human approval gate → apply an immutable chart revision → return the updated table and final response`. Read requests stop at a chat preview. Ambiguous scope, insufficient evidence, conflicting sources, or unsupported requests pause for human input instead of guessing.
+- **Refinement guardrails:** The system prompt gives the agent a patent-analyst persona, treats uploaded documents and web pages as untrusted evidence rather than instructions, requires source citations for proposed edits, forbids invented or silently paraphrased evidence, preserves row IDs/order and source links, and forbids table mutation before explicit approval. Approval supports approve, reject, or edit of the proposed patch.
+- **Refinement persistence:** Conversation turns and assistant/tool events are stored in `messages`; pending proposals and approval decisions are stored in `agent_actions` with the run and audit trail; approved changes create a new `chart_revisions`/`chart_rows` revision. Refinement checkpoints are stored with the chat/run/message thread identifiers so a human approval can safely resume after refresh.
+- **Image provenance:** Every document image will receive a stable image ID tied to its file ID, page number, section/claim label, nearby anchor text, and bounding box. Image prompts and model output must reference that image ID; image-to-row links are accepted only when the ID belongs to the same source document. Uncertain section associations remain unlinked for review rather than being guessed.
+- **MVP chart-import flow:** Claim-chart upload starts a persisted run immediately. A background flow loads the stored claim-chart files, converts each chart into a deterministic draft, evaluates each draft against its source, collates the approved rows from all uploaded charts into one combined chart, saves the table revision, and exposes the table through a polling endpoint. The frontend shows a three-column shimmer table while this happens. After the table is visible, a separate confidence-generation flow scores each merged row and updates the AI Evidence column. Supporting documents and prompts are stored independently from the composer while table creation is in progress; refinement execution is a later step.
+- **Database:** MongoDB Atlas.
+- **MongoDB responsibilities:** Cases, uploaded-file metadata, claim-chart revisions, evidence chunks, evidence links, conversations, messages, suggestions, approvals, audit events, exports, and LangGraph checkpoints.
+- **Refinement action collection:** `agent_actions` stores source-linked table proposals and their pending, applied, or rejected approval state.
+- **File storage:** MongoDB Atlas GridFS from the beginning for original uploaded documents and generated exports; no local-file persistence.
+- **Source and workspace separation:** The original uploaded PDF/XLSX is stored immutably in GridFS as the import source and read-only reference. The system creates a separate editable claim-chart workspace from it; analysts work on the digital workspace after import and do not edit the original file. Every workspace row retains a reference to its source document location.
+- **Memory separation:** Permanent application and conversation memory lives in MongoDB. LangGraph stores active workflow/checkpoint state only.
+- **Undo model:** Immutable chart revisions and audit events; undo creates a compensating revision instead of deleting history.
+- **MVP document formats:** PDF/XLSX for claim charts; PDF/DOCX for supporting documents. Original images and image-only PDF pages may be preserved and displayed, but reliable table-row import requires machine-readable structure or a review fallback. Legacy `.xls`/`.doc`, CSV, TXT, and arbitrary formats are outside the MVP until an explicit parser is added.
+- **Send workflow:** Selecting claim-chart files stages them below the claim-chart tile. The prominent `Start building chart` action persists the files, creates the chat/run, and starts background table preparation. A right-side assistant panel opens at the same time. Its attachment button persists optional PDF/DOCX supporting documents independently, and Send/Enter persists the prompt as a queued message against the active run while the table is processing or after it is ready. Shift+Enter remains available for a new line.
+- **Chat creation:** Proceeding with staged claim-chart files creates the persisted chat/run and adds it to Recent charts. Prompt submission does not restart chart preparation.
+- **Database setup:** The FastAPI backend owns the Atlas connection through `MONGODB_URI` and `DB_NAME` in a gitignored backend `.env`, initializes collections and indexes, and repeats file-size and duplicate-name validation server-side. No local MongoDB instance is used.
+- **Demo hosting:** Vercel Services will host one iLumos project with the Next.js frontend at `/` and the FastAPI service at `/backend`. The browser uses the same-origin `/backend` API path; MongoDB Atlas and Ollama Cloud credentials remain server-side Vercel environment variables. The first deployment is a preview for demo validation. The current background processing is suitable for the MVP preview; a durable queue/worker is a later production hardening step.
+- **Workspace persistence:** The backend exposes a workspace read endpoint that restores the latest run, table revision, persisted messages, and supporting-document references for a recent chart. Message records can reference the supporting files used with that prompt. Confidence generation is claimed with an atomic MongoDB state transition so only one stream can score a run at a time; failed confidence runs remain retryable.
+- **LLM response handling:** Ollama requests retry once with a stricter JSON-only instruction when the model returns malformed or non-JSON content. The backend also safely extracts evaluator-shaped JSON after model preambles, markdown fences, thinking blocks, or list-form output, and normalizes supported message-content shapes. A second failure marks the operation failed without exposing an unvalidated result.
+- **Atlas isolation:** iLumos must use its own Atlas project, cluster, database user, and database name. Configuration details from the supplied TrueIdentity project are not reused.
+- **Collection ownership:** Backend startup creates and indexes iLumos collections under the configured `DB_NAME` (default `ilumos`); TrueIdentity databases or collections are never read or written. GridFS uses the separate `ilumos_files` bucket.
+- **Atlas deployment:** A dedicated Atlas project `iLumos` and free AWS cluster `iLumos-MVP` now host the `ilumos` database. Its collections are `chats`, `analysis_runs`, `files`, `messages`, `chart_revisions`, `chart_rows`, `supporting_documents`, `verification_results`, `agent_actions`, `audit_events`, and `langgraph_checkpoints`, with GridFS collections under the `ilumos_files` bucket.
+- **Multiple charts:** One run can contain multiple claim-chart files; they are merged into one combined chart artifact while preserving each source document association. If three files contain 30 rows each, the combined chart contains 90 rows.
+- **Processing:** Each source document is extracted and evaluated independently, then its approved rows are combined into the single chart while preserving source sheet/cell or document locations.
+- **MVP document serialization:** XLSX files are converted from worksheet cells, merged ranges, and drawing anchors; PDFs are converted from page text blocks, table geometry, embedded images, and page/region renders where needed. PDF merged headers are reconciled with populated body columns so claim text is not lost on subsequent pages, and a repeated opening claim caused by a duplicated cover page is removed when it is strongly matched to the next page. Every extracted unit receives a source reference. The LLM receives labeled text/structure and draft rows, compares them with the uploaded chart representation, and returns references to existing units; it does not receive or interpret images in this milestone.
+- **Asset persistence:** Extracted chart assets are written to GridFS with bounded concurrency and their metadata is inserted in bulk. Image references remain tied to the source file, page, and location.
+- **Current import output:** After import, the initial upload surface changes to one collated digital claim-chart table. It has three columns: `Patent Claim`, `Evidence of Infringement`, and `AI Evidence`. Each `AI Evidence` cell contains the confidence percentage and a short remark. The original PDF/XLSX remains available as a read-only source reference.
+
+## Finalized design
+
+- **Design direction:** Ink Workspace.
+- **Primary working theme:** Dark theme.
+- **Matching theme:** Light theme with the same layout and information hierarchy.
+- **Visual character:** Premium modern AI-chat experience with a professional, calm, evidence-oriented feel for patent analysts and attorneys.
+- **Visual language:** Dark ink/charcoal surfaces, warm ivory/light surfaces, Lumenci orange accent, restrained typography, generous spacing, clear hierarchy, and subtle borders.
+- **Approved reference:** The last selected Ink Workspace design and its light/dark variants.
+
+## Current frontend implementation slice
+
+The current frontend is implemented as a Next.js app with the Tailwind/PostCSS scaffold in place. The dark workspace includes the reference sidebar treatment and a warm-white center surface inside a compact black frame that continues around the top, right, and bottom edges.
+
+The implemented dark-theme sidebar contains:
+
+- iLumos by Lumenci logo;
+- New chart button;
+- Recent charts section is shown only when charts exist; it is currently hidden because there are no chart entries.
+
+Sidebar typography, width, button scale, and top/bottom padding are compact and minimal while preserving clear hierarchy. The Recent charts heading uses muted white-grey, while chart titles use a lighter off-white at weight 400 and document icons use the same off-white tone.
+
+The sidebar is fixed to the viewport height. When recent charts exceed the available space, only the Recent charts list scrolls; the outer black frame and its top/bottom padding remain fixed and visible. Recent charts load through the same-origin API proxy so persisted Atlas charts are visible in the browser.
+
+The right assistant panel follows the same fixed-height behavior. Its conversation history scrolls independently while the composer remains anchored at the bottom and the surrounding black frame remains visible.
+
+### Basic micro-interactions
+
+- Logo accent gently brightens on hover.
+- New chart button has a subtle orange hover state and gentle press state.
+- Recent chat rows receive a soft hover highlight.
+- The active recent chat has a small orange indicator.
+- Selection and focus transitions are short and restrained.
+- Reduced-motion preferences are respected.
+
+The center surface contains the new-chart start state: a larger centered patent/document icon, a `Start here · Step 1 of 2` label, “Upload your claim chart” heading, supporting sentence, one larger claim-chart upload card, and a prominent disabled-until-ready `Start building chart` action at the bottom. Selecting one or more claim charts stages file chips below the tile; the files remain outside the chat composer until the start action is clicked. The start action opens a dark right-side assistant panel with a scrollable conversation history, paperclip attachment control, prompt composer, and send control, while the center becomes the three-column shimmer table during background processing. Claim charts accept XLSX/PDF files smaller than 5 MB; assistant attachments accept DOCX/PDF files smaller than 15 MB. Supporting documents can be added, and prompts can be typed and queued, while the table is being built. The resulting table has `Patent Claim`, `Evidence of Infringement`, and `AI Evidence` columns. After it is displayed, the separate confidence-generation stream shows a circular loading indicator in each unscored `AI Evidence` cell and updates cells one at a time as each row’s confidence call completes. Images are preserved as labeled source assets and attached by reference; they are not interpreted. Duplicate filenames are rejected server-side across the run. Recent charts are loaded from MongoDB on startup. Selecting a recent chart restores its persisted workspace, including table rows, chat history, and supporting-file references. Async table polling and confidence streams are cancelled or ignored when the user switches workspaces.
+The chart result table now expands into the available center height, reducing unused space below the table while retaining scrolling for longer charts.
+
+The right-side assistant now polls persisted refinement messages, renders read previews with source references, and renders source-linked cell-level proposals with explicit Approve/Reject controls. Its Send control is locked while a prompt and response are in flight, shows a loading spinner, and prevents duplicate submissions. The composer displays four lines by default and scrolls internally for longer prompts. Supporting files sent with a prompt move from the composer into that user message as visible references, while the backend persists and passes their file IDs to the refinement graph together with the prompt. Only unsent/staged supporting files remain in the composer when a workspace is reopened. Approving a proposal refreshes the immutable table revision and restarts confidence generation when source columns changed; rejecting it leaves the table unchanged.
+
+## Finalized sidebar text tags
+
+- `New chart`
+- `Recent charts`
