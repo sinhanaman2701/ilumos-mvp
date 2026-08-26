@@ -163,7 +163,7 @@ class ImportContractTests(unittest.TestCase):
 
         first = {
             **base_state,
-            "prompt": "Use this document to refine the evidence of infringement of row 7.",
+            "prompt": "Use this document to refine the evidence of infringement of row serial number 7.",
             "history": [],
         }
         with patch("app.refinement_agent.request_ollama_json", return_value=fake_route):
@@ -213,7 +213,7 @@ class ImportContractTests(unittest.TestCase):
             ),
             "history": [],
             "rows": [{"_id": row_id, "rowIndex": 7, "patentClaim": claim}],
-            "table_context": '{"rows":[{"rowId":"%s","rowIndex":7,"patentClaim":"%s"}]}'
+            "table_context": '{"rows":[{"rowId":"%s","rowIndex":7,"serialNumber":7,"patentClaim":"%s"}]}'
             % (row_id, claim),
             "documents": [{
                 "sourceId": "doc:supporting-1",

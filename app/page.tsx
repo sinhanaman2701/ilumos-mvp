@@ -16,6 +16,7 @@ type RecentChat = {
 type ChartRow = {
   rowId: string;
   rowIndex: number;
+  serialNumber?: number;
   patentClaim: string;
   evidenceOfInfringement: string;
   aiEvidence: string;
@@ -864,11 +865,12 @@ export default function Home() {
               <div className="chart-table-wrap">
                 <table className="chart-table" aria-label="Chart loading preview">
                   <thead>
-                    <tr><th>Patent Claim</th><th>Evidence of Infringement</th><th>AI Evidence</th></tr>
+                    <tr><th className="chart-serial-column">S. No.</th><th>Patent Claim</th><th>Evidence of Infringement</th><th>AI Evidence</th></tr>
                   </thead>
                   <tbody>
                     {Array.from({ length: 8 }, (_, index) => (
                       <tr key={index}>
+                        <td className="chart-serial-cell"><span className="table-shimmer table-shimmer-short" /></td>
                         <td><span className="table-shimmer table-shimmer-wide" /></td>
                         <td><span className="table-shimmer" /></td>
                         <td><span className="table-shimmer table-shimmer-short" /></td>
@@ -955,6 +957,7 @@ export default function Home() {
                 <table className="chart-table">
                   <thead>
                     <tr>
+                      <th className="chart-serial-column">S. No.</th>
                       <th>Patent Claim</th>
                       <th>Evidence of Infringement</th>
                       <th>AI Evidence</th>
@@ -963,8 +966,10 @@ export default function Home() {
                   <tbody>
                     {processedChart.map((row) => {
                       const rowId = row.rowId || String(row.rowIndex);
+                      const serialNumber = row.serialNumber ?? row.rowIndex;
                       return (
                       <tr key={rowId}>
+                        <td className="chart-serial-cell" aria-label={`Serial number ${serialNumber}`}>{serialNumber}</td>
                         <td>{row.patentClaim || "—"}</td>
                         <td>
                           {editingEvidenceRowId === rowId ? (

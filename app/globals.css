@@ -412,6 +412,18 @@ button { border: 0; }
 .chart-table td:last-child { border-right: 0; }
 .chart-table tr:last-child td { border-bottom: 0; }
 
+.chart-table .chart-serial-column,
+.chart-table .chart-serial-cell {
+  width: 64px;
+  text-align: center;
+}
+
+.chart-table .chart-serial-cell {
+  color: #747979;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
 .chart-table th {
   background: #f8f6f0;
   color: #666c6d;

@@ -159,6 +159,7 @@ def serialize_chart_row(row: dict) -> dict:
     return {
         "rowId": str(row["_id"]) if isinstance(row.get("_id"), ObjectId) else str(row.get("rowId", "")),
         "rowIndex": row["rowIndex"],
+        "serialNumber": row["rowIndex"],
         "patentClaim": row["patentClaim"],
         "evidenceOfInfringement": row["evidenceOfInfringement"],
         "aiEvidence": row.get("aiEvidence", ""),
@@ -731,6 +732,7 @@ def _build_chart_pdf(*, title: str, rows: list[dict]) -> bytes:
     )
 
     table_data = [[
+        Paragraph("S. No.", header_style),
         Paragraph("Patent Claim", header_style),
         Paragraph("Evidence of Infringement", header_style),
         Paragraph("AI Evidence", header_style),
@@ -746,6 +748,7 @@ def _build_chart_pdf(*, title: str, rows: list[dict]) -> bytes:
         else:
             ai_cell = Paragraph(_pdf_text(row.get("aiEvidence") or "-"), cell_style)
         table_data.append([
+            Paragraph(str(row.get("rowIndex", "-")), cell_style),
             Paragraph(_pdf_text(row.get("patentClaim")), cell_style),
             Paragraph(_pdf_text(row.get("evidenceOfInfringement")), cell_style),
             ai_cell,
@@ -753,7 +756,7 @@ def _build_chart_pdf(*, title: str, rows: list[dict]) -> bytes:
 
     table = Table(
         table_data,
-        colWidths=[58 * mm, 103 * mm, 80 * mm],
+        colWidths=[14 * mm, 55 * mm, 98 * mm, 74 * mm],
         repeatRows=1,
         splitByRow=1,
         hAlign="LEFT",

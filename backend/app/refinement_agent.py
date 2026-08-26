@@ -39,6 +39,8 @@ Hard rules:
 - Every proposed cell change must cite at least one supplied sourceId.
 - Read requests must be answered as a preview in chat; return an empty patches array.
 - Never apply a change. Return a proposal only. The application will request human approval.
+- The table's visible serial number is the same value as its rowIndex. Use that serial number
+  to identify rows when the user refers to a row number.
 - Evidence-edit requests that identify a row by number or quote a unique claim and provide an
   attached supporting document are actionable; do not ask the user to reattach the source or
   choose between evidenceOfInfringement, Patent Claim, or AI Evidence. Propose an
@@ -62,6 +64,9 @@ public web search. Determine whether the user wants a read preview, an edit prop
 clarifying question. Resolve row IDs only from the supplied table. Do not draft edits here.
 Only the evidenceOfInfringement column may ever be proposed for editing; Patent Claim and AI
 Evidence are read-only.
+The table includes a visible serial number for each row; it is the same value as rowIndex and
+is the analyst-facing row reference. Resolve phrases such as "serial number 7", "S. No. 7", or
+"row 7" to that row before using the internal rowId.
 Attached supporting-document content and source IDs are supplied in the request context. Use
 that context when deciding whether a clear evidence-refinement request is actionable. If the
 user names a unique claim or row, asks to refine its evidence, and a supporting document is
@@ -224,8 +229,13 @@ def _source_ids(value: Any) -> Iterable[str]:
 
 
 def _requested_row_index(prompt: str) -> int | None:
-    """Resolve the common human-facing row reference before asking the model."""
-    match = re.search(r"\b(?:row|claim|element)\s*(?:number\s*)?(\d+)\b", prompt, re.IGNORECASE)
+    """Resolve a visible row/serial reference before asking the model."""
+    match = re.search(
+        r"\b(?:(?:row\s+)?serial\s*(?:number|no\.?)|(?:row\s+)?s\.?\s*no\.?|"
+        r"(?:row|claim|element)(?:\s+number)?)\s*[:#-]?\s*(\d+)\b",
+        prompt,
+        re.IGNORECASE,
+    )
     return int(match.group(1)) if match else None
 
 
@@ -331,6 +341,7 @@ class RefinementAgent:
             {
                 "rowId": str(row["_id"]),
                 "rowIndex": row["rowIndex"],
+                "serialNumber": row["rowIndex"],
                 "patentClaim": row.get("patentClaim", ""),
                 "evidenceOfInfringement": row.get("evidenceOfInfringement", ""),
                 "aiEvidence": row.get("aiEvidence", ""),
